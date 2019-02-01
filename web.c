@@ -42,7 +42,7 @@ const char *xml =
 	"   <minor>0</minor>\r\n"
 	" </specVersion>\r\n"
 	" <device>\r\n"
-	"  <deviceType>urn:schemas-upnp-org:device:InternetGatewayDevice:1</deviceType>\r\n"
+	"  <deviceType>" DEVICE_TYPE "</deviceType>\r\n"
 	"  <friendlyName>%s</friendlyName>\r\n"
 	"  <manufacturer>%s</manufacturer>\r\n%s"
 	"  <modelName>%s</modelName>\r\n"

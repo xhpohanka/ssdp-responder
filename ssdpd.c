@@ -66,7 +66,7 @@ LIST_HEAD(, ifsock) il = LIST_HEAD_INITIALIZER();
 static char *supported_types[] = {
 	SSDP_ST_ALL,
 	"upnp:rootdevice",
-	"urn:schemas-upnp-org:device:InternetGatewayDevice:1",
+	DEVICE_TYPE,
 	uuid,
 	NULL
 };
