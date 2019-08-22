@@ -26,6 +26,7 @@
 #define MAX_NUM_IFACES       100
 #define MAX_PKT_SIZE         512
 #define MC_SSDP_GROUP        "239.255.255.250"
+#define MC_SSDP_GROUP_IPV6   "FF02::C"
 #define MC_SSDP_PORT         1900
 #define LOCATION_PORT        (MC_SSDP_PORT + 1)
 #define LOCATION_DESC        "/description.xml"
@@ -34,12 +35,14 @@
 
 #define logit(lvl, fmt, args...) syslog(lvl, fmt, ##args)
 
-#define ENABLE_SOCKOPT(sd, level, opt)					\
+#define SET_SOCKOPT(sd, level, opt, v)					\
         do {								\
-                int val = 1;						\
+                int val = v;						\
                 if (setsockopt(sd, level, opt, &val, sizeof(val)) < 0)	\
                         warn("Failed enabling %s for web service", #opt); \
         } while (0);
+#define ENABLE_SOCKOPT(sd, level, opt)	SET_SOCKOPT(sd, level, opt, 1)
+#define DISABLE_SOCKOPT(sd, level, opt)	SET_SOCKOPT(sd, level, opt, 0)
 
 extern int debug;
 extern char uuid[];

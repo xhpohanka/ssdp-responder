@@ -34,6 +34,7 @@
 #include <arpa/inet.h>
 #include <netinet/ip.h>
 #include <netinet/udp.h>
+#include <net/if.h>
 #include <sys/param.h>		/* MIN() */
 #include <sys/socket.h>
 
@@ -55,7 +56,7 @@ struct ifsock {
 	int in, out;
 
 	/* Interface address and netmask */
-	struct sockaddr_in addr;
+	struct sockaddr_storage addr;
 	struct sockaddr_in mask;
 
 	void (*cb)(int);
@@ -90,12 +91,40 @@ static struct ifsock *find_outbound(struct sockaddr *sa)
 	LIST_FOREACH(ifs, &il, link) {
 		in_addr_t a, m;
 
-		a = ifs->addr.sin_addr.s_addr;
-		m = ifs->mask.sin_addr.s_addr;
+		const struct sockaddr_in *addr = (struct sockaddr_in *) &ifs->addr;
+		const struct sockaddr_in *mask = (struct sockaddr_in *) &ifs->mask;
+		a = addr->sin_addr.s_addr;
+		m = mask->sin_addr.s_addr;
 		if (a == htonl(INADDR_ANY) || m == htonl(INADDR_ANY))
 			continue;
 
-		if ((a & m) == (cand & m))
+		if ((a & m) == (cand & m)) {
+			return ifs;
+		}
+	}
+
+	return NULL;
+}
+
+static struct ifsock *find_outbound6(struct sockaddr *sa)
+{
+	struct in6_addr cand;
+	struct ifsock *ifs;
+	struct sockaddr_in6 *addr = (struct sockaddr_in6 *)sa;
+
+	cand = addr->sin6_addr;
+	LIST_FOREACH(ifs, &il, link) {
+		in_addr_t a, m;
+
+		const struct sockaddr_in6 *addr = (struct sockaddr_in6 *) &ifs->addr;
+
+		if (memcmp(&addr->sin6_addr, &in6addr_any, sizeof(struct in6_addr)) == 0)
+			continue;
+
+		if (memcmp(&addr->sin6_addr, &cand, sizeof(struct in6_addr)) == 0)
+			return ifs;
+
+		if (IN6_IS_ADDR_LINKLOCAL(&addr->sin6_addr))
 			return ifs;
 	}
 
@@ -106,14 +135,26 @@ static struct ifsock *find_outbound(struct sockaddr *sa)
 static struct ifsock *find_iface(struct sockaddr *sa)
 {
 	struct ifsock *ifs;
-	struct sockaddr_in *addr = (struct sockaddr_in *)sa;
 
 	if (!sa)
 		return NULL;
 
 	LIST_FOREACH(ifs, &il, link) {
-		if (ifs->addr.sin_addr.s_addr == addr->sin_addr.s_addr)
-			return ifs;
+		if (sa->sa_family == AF_INET) {
+			struct sockaddr_in *addr = (struct sockaddr_in *) sa;
+			const struct sockaddr_in *i_addr = (struct sockaddr_in *) &ifs->addr;
+			if (i_addr->sin_addr.s_addr == addr->sin_addr.s_addr)
+				return ifs;
+		}
+		else if (sa->sa_family == AF_INET6) {
+			struct sockaddr_in6 *addr = (struct sockaddr_in6 *) sa;
+			const struct sockaddr_in6 *i_addr = (struct sockaddr_in6 *) &ifs->addr;
+			if (memcmp(&i_addr->sin6_addr, &i_addr->sin6_addr, sizeof(i_addr->sin6_addr)) == 0)
+			/* ipv6 listen on in6addr_any */
+			if (memcmp(&addr->sin6_addr, &i_addr->sin6_addr, sizeof(i_addr->sin6_addr)) == 0
+				|| memcmp(&addr->sin6_addr, &in6addr_any, sizeof(i_addr->sin6_addr)) == 0)
+				return ifs;
+		}
 	}
 
 	return NULL;
@@ -137,7 +178,7 @@ int register_socket(int in, int out, struct sockaddr *addr, struct sockaddr *mas
 	ifs->out  = out;
 	ifs->mod  = 1;
 	ifs->cb   = cb;
-	ifs->addr = *address;
+	ifs->addr = * (struct sockaddr_storage *) address;
 	if (mask)
 		ifs->mask = *netmask;
 	LIST_INSERT_HEAD(&il, ifs, link);
@@ -148,61 +189,107 @@ int register_socket(int in, int out, struct sockaddr *addr, struct sockaddr *mas
 static int open_socket(char *ifname, struct sockaddr *addr, int port)
 {
 	int sd, val, rc;
-	char loop;
-	struct ip_mreqn mreq;
-	struct sockaddr_in sin, *address = (struct sockaddr_in *)addr;
 
-	sd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-	if (sd < 0)
-		return -1;
+	if (addr->sa_family == AF_INET6) {
+		struct ipv6_mreq mreq;
+		struct sockaddr_in6 sin, *address = (struct sockaddr_in6 *)addr;
+		char addr_string[INET6_ADDRSTRLEN];
+		int ifid = if_nametoindex(ifname);
 
-	sin.sin_family = AF_INET;
-	sin.sin_port = htons(port);
-	sin.sin_addr = address->sin_addr;
-	if (bind(sd, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
-		close(sd);
-		logit(LOG_ERR, "Failed binding to %s:%d: %s", inet_ntoa(address->sin_addr), port, strerror(errno));
-		return -1;
+		inet_ntop(AF_INET6, &address->sin6_addr, addr_string, sizeof(addr_string));
+		sd = socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+		if (sd < 0)
+			return -1;
+
+		ENABLE_SOCKOPT(sd, IPPROTO_IPV6, IPV6_V6ONLY);
+		ENABLE_SOCKOPT(sd, SOL_SOCKET, SO_REUSEADDR);
+		ENABLE_SOCKOPT(sd, SOL_SOCKET, SO_REUSEPORT);
+
+		sin.sin6_family = AF_INET6;
+		sin.sin6_port = htons(port);
+		sin.sin6_addr = address->sin6_addr;
+		sin.sin6_scope_id = ifid;
+
+		if (bind(sd, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
+			close(sd);
+			logit(LOG_ERR, "Failed binding to [%s]:%d: %s", addr_string, port, strerror(errno));
+			return -1;
+		}
+
+		memset(&mreq, 0, sizeof(mreq));
+		inet_pton(AF_INET6, MC_SSDP_GROUP_IPV6, &mreq.ipv6mr_multiaddr);
+		mreq.ipv6mr_interface = ifid;
+
+		if (setsockopt(sd, IPPROTO_IPV6, IPV6_JOIN_GROUP, &mreq, sizeof(mreq))) {
+			close(sd);
+			logit(LOG_ERR, "Failed joining group %s: %s", MC_SSDP_GROUP_IPV6, strerror(errno));
+			return -1;
+		}
+		DISABLE_SOCKOPT(sd, IPPROTO_IPV6, IPV6_MULTICAST_LOOP);
+
+		rc = setsockopt(sd, IPPROTO_IPV6, IPV6_MULTICAST_IF, &ifid, sizeof(ifid));
+		if (rc < 0) {
+			close(sd);
+			logit(LOG_ERR, "Failed setting multicast interface: %s", strerror(errno));
+			return -1;
+		}
+
+		logit(LOG_DEBUG, "Adding new interface %s with address %s", ifname, addr_string);
 	}
+	else {
+		struct ip_mreqn mreq;
+		struct sockaddr_in sin, *address = (struct sockaddr_in *)addr;
+
+		sd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+		if (sd < 0)
+			return -1;
+
+		ENABLE_SOCKOPT(sd, SOL_SOCKET, SO_REUSEADDR);
+		ENABLE_SOCKOPT(sd, SOL_SOCKET, SO_REUSEPORT);
+
+		sin.sin_family = AF_INET;
+		sin.sin_port = htons(port);
+		sin.sin_addr = address->sin_addr;
+		if (bind(sd, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
+			close(sd);
+			logit(LOG_ERR, "Failed binding to %s:%d: %s", inet_ntoa(address->sin_addr), port, strerror(errno));
+			return -1;
+		}
 #if 0
-        ENABLE_SOCKOPT(sd, SOL_SOCKET, SO_REUSEADDR);
+		ENABLE_SOCKOPT(sd, SOL_SOCKET, SO_REUSEADDR);
 #ifdef SO_REUSEPORT
-        ENABLE_SOCKOPT(sd, SOL_SOCKET, SO_REUSEPORT);
+		ENABLE_SOCKOPT(sd, SOL_SOCKET, SO_REUSEPORT);
 #endif
 #endif
-	memset(&mreq, 0, sizeof(mreq));
-	mreq.imr_address = address->sin_addr;
-	mreq.imr_multiaddr.s_addr = inet_addr(MC_SSDP_GROUP);
-        if (setsockopt(sd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq))) {
-		close(sd);
-		logit(LOG_ERR, "Failed joining group %s: %s", MC_SSDP_GROUP, strerror(errno));
-		return -1;
+		memset(&mreq, 0, sizeof(mreq));
+		mreq.imr_address = address->sin_addr;
+		mreq.imr_multiaddr.s_addr = inet_addr(MC_SSDP_GROUP);
+
+		if (setsockopt(sd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq))) {
+			close(sd);
+			logit(LOG_ERR, "Failed joining group %s: %s", MC_SSDP_GROUP, strerror(errno));
+			return -1;
+		}
+
+		val = 2;		/* Default 2, but should be configurable */
+		rc = setsockopt(sd, IPPROTO_IP, IP_MULTICAST_TTL, &val, sizeof(val));
+		if (rc < 0) {
+			close(sd);
+			logit(LOG_ERR, "Failed setting multicast TTL: %s", strerror(errno));
+			return -1;
+		}
+
+		DISABLE_SOCKOPT(sd, IPPROTO_IP, IP_MULTICAST_LOOP);
+
+		rc = setsockopt(sd, IPPROTO_IP, IP_MULTICAST_IF, &address->sin_addr, sizeof(address->sin_addr));
+		if (rc < 0) {
+			close(sd);
+			logit(LOG_ERR, "Failed setting multicast interface: %s", strerror(errno));
+			return -1;
+		}
+		logit(LOG_DEBUG, "Adding new interface %s with address %s", ifname, inet_ntoa(address->sin_addr));
 	}
 
-	val = 2;		/* Default 2, but should be configurable */
-	rc = setsockopt(sd, IPPROTO_IP, IP_MULTICAST_TTL, &val, sizeof(val));
-	if (rc < 0) {
-		close(sd);
-		logit(LOG_ERR, "Failed setting multicast TTL: %s", strerror(errno));
-		return -1;
-	}
-
-	loop = 0;
-	rc = setsockopt(sd, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
-	if (rc < 0) {
-		close(sd);
-		logit(LOG_ERR, "Failed disabing multicast loop: %s", strerror(errno));
-		return -1;
-	}
-
-	rc = setsockopt(sd, IPPROTO_IP, IP_MULTICAST_IF, &address->sin_addr, sizeof(address->sin_addr));
-	if (rc < 0) {
-		close(sd);
-		logit(LOG_ERR, "Failed setting multicast interface: %s", strerror(errno));
-		return -1;
-	}
-
-	logit(LOG_DEBUG, "Adding new interface %s with address %s", ifname, inet_ntoa(address->sin_addr));
 
 	return sd;
 }
@@ -227,24 +314,46 @@ static int close_socket(void)
 static int filter_addr(struct sockaddr *sa)
 {
 	struct ifsock *ifs;
-	struct sockaddr_in *sin = (struct sockaddr_in *)sa;
 
 	if (!sa)
 		return 1;
 
-	if (sa->sa_family != AF_INET)
-		return 1;
-
-	if (sin->sin_addr.s_addr == htonl(INADDR_ANY))
-		return 1;
-
-	if (sin->sin_addr.s_addr == htonl(INADDR_LOOPBACK))
-		return 1;
-
-	ifs = find_outbound(sa);
-	if (ifs) {
-		if (ifs->addr.sin_addr.s_addr != htonl(INADDR_ANY))
+	if (sa->sa_family == AF_INET) {
+		struct sockaddr_in *sin = (struct sockaddr_in *)sa;
+		if (sin->sin_addr.s_addr == htonl(INADDR_ANY))
 			return 1;
+
+		if (sin->sin_addr.s_addr == htonl(INADDR_LOOPBACK))
+			return 1;
+
+		ifs = find_outbound(sa);
+		if (ifs) {
+			const struct sockaddr_in *addr = (struct sockaddr_in *) &ifs->addr;
+			if (addr->sin_addr.s_addr != htonl(INADDR_ANY))
+				return 1;
+		}
+	}
+	else if (sa->sa_family == AF_INET6) {
+		struct sockaddr_in6 *sin = (struct sockaddr_in6 *)sa;
+
+		if (memcmp(&sin->sin6_addr, &in6addr_any, sizeof(sin->sin6_addr)) == 0)
+			return 1;
+
+		if (memcmp(&sin->sin6_addr, &in6addr_loopback, sizeof(sin->sin6_addr)) == 0)
+			return 1;
+
+		if (!IN6_IS_ADDR_LINKLOCAL(&sin->sin6_addr))
+			return 1;
+
+		ifs = find_outbound6(sa);
+		if (ifs) {
+			const struct sockaddr_in6 *addr = (struct sockaddr_in6 *) &ifs->addr;
+			if (memcmp(&addr->sin6_addr, &in6addr_any, sizeof(addr->sin6_addr)) != 0)
+				return 1;
+		}
+	}
+	else {
+		return 1;
 	}
 
 	return 0;
@@ -275,6 +384,14 @@ static void compose_addr(struct sockaddr_in *sin, char *group, int port)
 	sin->sin_family      = AF_INET;
 	sin->sin_port        = htons(port);
 	sin->sin_addr.s_addr = inet_addr(group);
+}
+
+static void compose_addr6(struct sockaddr_in6 *sin, char *group, int port)
+{
+	memset(sin, 0, sizeof(*sin));
+	sin->sin6_family      = AF_INET6;
+	sin->sin6_port        = htons(port);
+	inet_pton(AF_INET6, group, &sin->sin6_addr);
 }
 
 static void compose_response(char *type, char *host, char *buf, size_t len)
@@ -376,10 +493,14 @@ static void send_search(struct ifsock *ifs, char *type)
 
 	memset(buf, 0, sizeof(buf));
 	compose_search(type, buf, sizeof(buf));
-	compose_addr((struct sockaddr_in *)&dest, MC_SSDP_GROUP, MC_SSDP_PORT);
+
+	if (ifs->addr.ss_family == AF_INET)
+		compose_addr((struct sockaddr_in *)&dest, MC_SSDP_GROUP, MC_SSDP_PORT);
+	else if (ifs->addr.ss_family == AF_INET6)
+		compose_addr6((struct sockaddr_in6 *)&dest, MC_SSDP_GROUP_IPV6, MC_SSDP_PORT);
 
 	logit(LOG_DEBUG, "Sending M-SEARCH ...");
-	num = sendto(ifs->out, buf, strlen(buf), 0, &dest, sizeof(struct sockaddr_in));
+	num = sendto(ifs->out, buf, strlen(buf), 0, &dest, sizeof(struct sockaddr_storage));
 	if (num < 0)
 		logit(LOG_WARNING, "Failed sending SSDP M-SEARCH");
 }
@@ -390,39 +511,62 @@ static void send_message(struct ifsock *ifs, char *type, struct sockaddr *sa)
 	size_t i, len, note = 0;
 	ssize_t num;
 	char host[NI_MAXHOST];
+	char host6[NI_MAXHOST+2];
+	char *host_out;
 	char buf[MAX_PKT_SIZE];
-	struct sockaddr dest;
-	struct sockaddr_in *sin = (struct sockaddr_in *)sa;
+	struct sockaddr_storage dest;
 
 	gethostname(hostname, sizeof(hostname));
-	s = getnameinfo((struct sockaddr *)&ifs->addr, sizeof(struct sockaddr_in), host, sizeof(host), NULL, 0, NI_NUMERICHOST);
+	s = getnameinfo((struct sockaddr *)&ifs->addr, sizeof(struct sockaddr_storage),
+			host, sizeof(host), NULL, 0, NI_NUMERICHOST);
 	if (s) {
 		logit(LOG_WARNING, "Failed getnameinfo(): %s", gai_strerror(s));
 		return;
 	}
 
-	if (ifs->addr.sin_addr.s_addr == htonl(INADDR_ANY))
-		return;
+	if (ifs->addr.ss_family == AF_INET) {
+		const struct sockaddr_in *addr = (struct sockaddr_in *) &ifs->addr;
+		if (addr->sin_addr.s_addr == htonl(INADDR_ANY))
+			return;
+	}
+	else if (ifs->addr.ss_family == AF_INET6) {
+		const struct sockaddr_in6 *addr = (struct sockaddr_in6 *) &ifs->addr;
+		if (memcmp(&addr->sin6_addr, &in6addr_any, sizeof(struct in6_addr)) == 0)
+			return;
+	}
 	if (ifs->out == -1)
 		return;
 
 	if (!strcmp(type, SSDP_ST_ALL))
 		type = NULL;
 
-	memset(buf, 0, sizeof(buf));
-	if (sin)
-		compose_response(type, host, buf, sizeof(buf));
-	else
-		compose_notify(type, host, buf, sizeof(buf));
+	host_out = host;
+	if (ifs->addr.ss_family == AF_INET6) {
+		char *pos = strchr(host, '%');
+		if (pos) {
+			*pos = '\0';
+			snprintf(host6, NI_MAXHOST+2, "[%s]", host);
+			host_out = host6;
+		}
+	}
 
-	if (!sin) {
+	memset(buf, 0, sizeof(buf));
+	if (sa)
+		compose_response(type, host_out, buf, sizeof(buf));
+	else
+		compose_notify(type, host_out, buf, sizeof(buf));
+
+	if (!sa) {
 		note = 1;
-		compose_addr((struct sockaddr_in *)&dest, MC_SSDP_GROUP, MC_SSDP_PORT);
-		sin = (struct sockaddr_in *)&dest;
+		if (ifs->addr.ss_family == AF_INET)
+			compose_addr((struct sockaddr_in *)&dest, MC_SSDP_GROUP, MC_SSDP_PORT);
+		else if (ifs->addr.ss_family == AF_INET6)
+			compose_addr6((struct sockaddr_in6 *)&dest, MC_SSDP_GROUP_IPV6, MC_SSDP_PORT);
+		sa = (struct sockaddr *) &dest;
 	}
 
 	logit(LOG_DEBUG, "Sending %s from %s ...", !note ? "reply" : "notify", host);
-	num = sendto(ifs->out, buf, strlen(buf), 0, sin, sizeof(struct sockaddr_in));
+	num = sendto(ifs->out, buf, strlen(buf), 0, sa, sizeof(struct sockaddr_storage));
 	if (num < 0)
 		logit(LOG_WARNING, "Failed sending SSDP %s, type: %s: %s", !note ? "reply" : "notify", type, strerror(errno));
 }
@@ -430,36 +574,51 @@ static void send_message(struct ifsock *ifs, char *type, struct sockaddr *sa)
 static void ssdp_recv(int sd)
 {
 	ssize_t len;
-	struct sockaddr sa;
-	socklen_t salen;
+	struct sockaddr_storage sa;
+	socklen_t salen = sizeof(sa);
 	char buf[MAX_PKT_SIZE];
 
 	memset(buf, 0, sizeof(buf));
-	len = recvfrom(sd, buf, sizeof(buf), MSG_DONTWAIT, &sa, &salen);
+	len = recvfrom(sd, buf, sizeof(buf), MSG_DONTWAIT, (struct sockaddr *) &sa, &salen);
 	if (len > 0) {
 		buf[len] = 0;
 
-		if (sa.sa_family != AF_INET)
+		if (sa.ss_family != AF_INET && sa.ss_family != AF_INET6)
 			return;
 
 		if (strstr(buf, "M-SEARCH *")) {
 			size_t i;
 			char *ptr, *type;
-			struct ifsock *ifs;
-			struct sockaddr_in *sin = (struct sockaddr_in *)&sa;
+			struct ifsock *ifs = NULL;
 
-			ifs = find_outbound(&sa);
+			char addr[INET6_ADDRSTRLEN];
+			int port = -1;
+			if (sa.ss_family == AF_INET) {
+				struct sockaddr_in *sin = (struct sockaddr_in *)&sa;
+
+				ifs = find_outbound((struct sockaddr *) &sa);
+				inet_ntop(AF_INET, &sin->sin_addr, addr, INET_ADDRSTRLEN);
+				port = ntohs(sin->sin_port);
+			}
+			else if (sa.ss_family == AF_INET6) {
+				struct sockaddr_in6 *sin = (struct sockaddr_in6 *) &sa;
+
+				ifs = find_outbound6((struct sockaddr *) &sa);
+				inet_ntop(AF_INET6, &sin->sin6_addr, addr, INET6_ADDRSTRLEN);
+				port = ntohs(sin->sin6_port);
+			}
+
 			if (!ifs) {
-				logit(LOG_DEBUG, "No matching socket for client %s", inet_ntoa(sin->sin_addr));
+				logit(LOG_DEBUG, "No matching socket for client %s", addr);
 				return;
 			}
-			logit(LOG_DEBUG, "Matching socket for client %s", inet_ntoa(sin->sin_addr));
+			logit(LOG_DEBUG, "Matching socket for client %s", addr);
 
 			type = strcasestr(buf, "\r\nST:");
 			if (!type) {
 				logit(LOG_DEBUG, "No Search Type (ST:) found in M-SEARCH *, assuming " SSDP_ST_ALL);
 				type = SSDP_ST_ALL;
-				send_message(ifs, type, &sa);
+				send_message(ifs, type, (struct sockaddr *) &sa);
 				return;
 			}
 
@@ -478,14 +637,13 @@ static void ssdp_recv(int sd)
 			for (i = 0; supported_types[i]; i++) {
 				if (!strcmp(supported_types[i], type)) {
 					logit(LOG_DEBUG, "M-SEARCH * ST: %s from %s port %d", type,
-					      inet_ntoa(sin->sin_addr), ntohs(sin->sin_port));
-					send_message(ifs, type, &sa);
+					      addr, port);
+					send_message(ifs, type, (struct sockaddr *) &sa);
 					return;
 				}
 			}
 
-			logit(LOG_DEBUG, "M-SEARCH * for unsupported ST: %s from %s", type,
-			      inet_ntoa(sin->sin_addr));
+			logit(LOG_DEBUG, "M-SEARCH * for unsupported ST: %s from %s", type, addr);
 		}
 	}
 }
@@ -502,18 +660,55 @@ static int multicast_init(void)
 		return -1;
 	}
 
-	memset(&sa, 0, sizeof(sa));
+	memset(sin, 0, sizeof(*sin));
 	sin->sin_family = AF_INET;
 	sin->sin_addr.s_addr = inet_addr(MC_SSDP_GROUP);
 	sin->sin_port = htons(MC_SSDP_PORT);
 
-	if (bind(sd, &sa, sizeof(*sin)) < 0) {
+	ENABLE_SOCKOPT(sd, SOL_SOCKET, SO_REUSEADDR);
+	ENABLE_SOCKOPT(sd, SOL_SOCKET, SO_REUSEPORT);
+
+	if (bind(sd, &sa, sizeof(sa)) < 0) {
 		close(sd);
 		logit(LOG_ERR, "Failed binding to %s:%d: %s", inet_ntoa(sin->sin_addr), MC_SSDP_PORT, strerror(errno));
 		return -1;
 	}
 
 	register_socket(sd, -1, &sa, NULL, ssdp_recv);
+
+	return sd;
+}
+
+static int multicast_init6(void)
+{
+	int sd, ret;
+	struct sockaddr_in6 sin;
+
+	sd = socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+	if (sd < 0) {
+		logit(LOG_ERR, "Failed opening multicast socket: %s", strerror(errno));
+		return -1;
+	}
+
+	memset(&sin, 0, sizeof(sin));
+
+	sin.sin6_family = AF_INET6;
+	sin.sin6_port = htons(MC_SSDP_PORT);
+	/* better listen on :: on all interfaces, we don't need sin6_scope then */
+//	inet_pton(AF_INET6, MC_SSDP_GROUP_IPV6, &sin.sin6_addr);
+	sin.sin6_addr = in6addr_any;
+
+	ENABLE_SOCKOPT(sd, IPPROTO_IPV6, IPV6_V6ONLY);
+	ENABLE_SOCKOPT(sd, SOL_SOCKET, SO_REUSEADDR);
+	ENABLE_SOCKOPT(sd, SOL_SOCKET, SO_REUSEPORT);
+
+	if (bind(sd, (struct sockaddr *) &sin, sizeof(sin)) < 0) {
+		close(sd);
+		logit(LOG_ERR, "Failed binding to [%s]:%d: %s", MC_SSDP_GROUP_IPV6, MC_SSDP_PORT, strerror(errno));
+		return -1;
+	}
+
+	register_socket(sd, -1, (struct sockaddr *) &sin, NULL, ssdp_recv);
 
 	return sd;
 }
@@ -531,6 +726,23 @@ static int multicast_join(int sd, struct sockaddr *sa)
 			return 0;
 
 		logit(LOG_ERR, "Failed joining group %s: %s", MC_SSDP_GROUP, strerror(errno));
+		return -1;
+	}
+
+	return 0;
+}
+
+static int multicast_join6(int sd, struct sockaddr *sa, char *name)
+{
+	struct ipv6_mreq mreq;
+	struct sockaddr_in *sin = (struct sockaddr_in *)sa;
+
+	memset(&mreq, 0, sizeof(mreq));
+	inet_pton(AF_INET6, MC_SSDP_GROUP_IPV6, &mreq.ipv6mr_multiaddr);
+
+	if (setsockopt(sd, IPPROTO_IPV6, IPV6_JOIN_GROUP, &mreq, sizeof(mreq))) {
+		close(sd);
+		logit(LOG_ERR, "Failed joining group %s: %s", MC_SSDP_GROUP_IPV6, strerror(errno));
 		return -1;
 	}
 
@@ -559,7 +771,16 @@ static int sweep(void)
 			continue;
 
 		modified++;
-		logit(LOG_DEBUG, "Removing stale ifs %s", inet_ntoa(ifs->addr.sin_addr));
+		char str[INET6_ADDRSTRLEN];
+		if (ifs->addr.ss_family == AF_INET) {
+			const struct sockaddr_in *addr = (struct sockaddr_in *) &ifs->addr;
+			inet_ntop(AF_INET, &addr->sin_addr, str, INET_ADDRSTRLEN);
+		}
+		else if (ifs->addr.ss_family == AF_INET6) {
+			const struct sockaddr_in6 *addr = (struct sockaddr_in6 *) &ifs->addr;
+			inet_ntop(AF_INET6, &addr->sin6_addr, str, INET6_ADDRSTRLEN);
+		}
+		logit(LOG_DEBUG, "Removing stale ifs %s", str);
 
 		LIST_REMOVE(ifs, link);
 		close(ifs->out);
@@ -569,7 +790,7 @@ static int sweep(void)
 	return modified;
 }
 
-static int ssdp_init(int in, char *iflist[], size_t num)
+static int ssdp_init(int in, int in6, char *iflist[], size_t num)
 {
 	int modified;
 	size_t i;
@@ -589,6 +810,16 @@ static int ssdp_init(int in, char *iflist[], size_t num)
 	for (ifa = ifaddrs; ifa; ifa = ifa->ifa_next) {
 		struct ifsock *ifs;
 
+		char addr[128];
+		if (ifa->ifa_addr->sa_family == AF_INET) {
+			// create IPv4 string
+			struct sockaddr_in *in = (struct sockaddr_in*) ifa->ifa_addr;
+			inet_ntop(AF_INET, &in->sin_addr, addr, sizeof(addr));
+		} else { // AF_INET6
+			// create IPv6 string
+			struct sockaddr_in6 *in6 = (struct sockaddr_in6*) ifa->ifa_addr;
+			inet_ntop(AF_INET6, &in6->sin6_addr, addr, sizeof(addr));
+		}
 		/* Do we already have it? */
 		ifs = find_iface(ifa->ifa_addr);
 		if (ifs) {
@@ -618,11 +849,21 @@ static int ssdp_init(int in, char *iflist[], size_t num)
 		if (sd < 0)
 			continue;
 
-		multicast_join(in, ifa->ifa_addr);
+		if (ifa->ifa_addr->sa_family == AF_INET) {
+			multicast_join(in, ifa->ifa_addr);
 
-		if (register_socket(in, sd, ifa->ifa_addr, ifa->ifa_netmask, ssdp_recv)) {
-			close(sd);
-			break;
+			if (register_socket(in, sd, ifa->ifa_addr, ifa->ifa_netmask, ssdp_recv)) {
+				close(sd);
+				break;
+			}
+		}
+		else if (ifa->ifa_addr->sa_family == AF_INET6) {
+			multicast_join6(in6, ifa->ifa_addr, NULL);
+
+			if (register_socket(in6, sd, ifa->ifa_addr, ifa->ifa_netmask, ssdp_recv)) {
+				close(sd);
+				break;
+			}
 		}
 		modified++;
 	}
@@ -819,7 +1060,7 @@ static int usage(int code)
 
 int main(int argc, char *argv[])
 {
-	int i, c, sd;
+	int i, c, sd, sd6;
 	int log_level = LOG_NOTICE;
 	int log_opts = LOG_CONS | LOG_PID;
 	int interval = NOTIFY_INTERVAL;
@@ -874,11 +1115,15 @@ int main(int argc, char *argv[])
 	if (sd < 0)
 		err(1, "Failed creating multicast socket");
 
+	sd6 = multicast_init6();
+	if (sd6 < 0)
+		err(1, "Failed creating multicast socket");
+
 	while (running) {
 		now = time(NULL);
 
 		if (rtmo <= now) {
-			if (ssdp_init(sd, &argv[optind], argc - optind) > 0)
+			if (ssdp_init(sd, sd6, &argv[optind], argc - optind) > 0)
 				announce(1);
 			rtmo = now + refresh;
 		}

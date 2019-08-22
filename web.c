@@ -54,49 +54,63 @@ const char *xml =
 
 
 /* Peek into SOCK_STREAM on accepted client socket to figure out inbound interface */
-static struct sockaddr_in *stream_peek(int sd, char *ifname)
+static struct sockaddr *stream_peek(int sd, char *ifname)
 {
-        struct ifaddrs *ifaddr, *ifa;
-        static struct sockaddr_in sin;
-        socklen_t len = sizeof(sin);
+	struct ifaddrs *ifaddr, *ifa;
+	static struct sockaddr_storage ss;
+	socklen_t len = sizeof(ss);
 
-        if (-1 == getsockname(sd, (struct sockaddr *)&sin, &len))
-                return NULL;
+	if (-1 == getsockname(sd, (struct sockaddr *) &ss, &len))
+		return NULL;
 
-        if (-1 == getifaddrs(&ifaddr))
-                return NULL;
+	if (-1 == getifaddrs(&ifaddr))
+		return NULL;
 
-        for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
-                size_t len = sizeof(struct in_addr);
-                struct sockaddr_in *iin;
+	for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+		size_t len = sizeof(struct in_addr);
 
-                if (!ifa->ifa_addr)
-                        continue;
+		if (!ifa->ifa_addr)
+			continue;
 
-                if (ifa->ifa_addr->sa_family != AF_INET)
-                        continue;
+		if (ifa->ifa_addr->sa_family == AF_INET) {
+			struct sockaddr_in *iin, *sin;
+			iin = (struct sockaddr_in *) ifa->ifa_addr;
+			sin = (struct sockaddr_in *) &ss;
+			if (!memcmp(&sin->sin_addr, &iin->sin_addr, sizeof(struct sockaddr_in))) {
+				strncpy(ifname, ifa->ifa_name, IF_NAMESIZE);
+				break;
+			}
+		}
+		else if (ifa->ifa_addr->sa_family == AF_INET6) {
+			struct sockaddr_in6 *iin6, *sin6;
+			iin6 = (struct sockaddr_in6 *) ifa->ifa_addr;
+			sin6 = (struct sockaddr_in6 *) &ss;
+			if (!memcmp(&sin6->sin6_addr, &iin6->sin6_addr, sizeof(struct sockaddr_in6))) {
+				strncpy(ifname, ifa->ifa_name, IF_NAMESIZE);
+				break;
+			}
+		}
+		else {
+			continue;
+		}
+	}
 
-                iin = (struct sockaddr_in *)ifa->ifa_addr;
-                if (!memcmp(&sin.sin_addr, &iin->sin_addr, len)) {
-                        strncpy(ifname, ifa->ifa_name, IF_NAMESIZE);
-                        break;
-                }
-        }
+	freeifaddrs(ifaddr);
 
-        freeifaddrs(ifaddr);
-
-        return &sin;
+	return (struct sockaddr *) &ss;
 }
 
-static void respond(int sd, struct sockaddr_in *sin)
+static void respond(int sd, struct sockaddr *sin)
 {
 	char *head = "HTTP/1.1 200 OK\r\n"
 		"Content-Type: text/xml\r\n"
 		"Connection: close\r\n"
 		"\r\n";
 	char hostname[64], url[128] = "";
+	char ip6[INET6_ADDRSTRLEN];
 	char mesg[1024], *reqline[3];
 	int rcvd, fd, bytes_read;
+	struct sockaddr_in6 *sin6;
 
 	memset(mesg, 0, sizeof(mesg));
 	rcvd = recv(sd, mesg, sizeof(mesg), 0);
@@ -129,13 +143,22 @@ static void respond(int sd, struct sockaddr_in *sin)
 #endif
 		logit(LOG_DEBUG, "Sending XML reply ...");
 		send(sd, head, strlen(head), 0);
+
+		sin6 = (struct sockaddr_in6 *) sin;
+		if (IN6_IS_ADDR_V4MAPPED(&sin6->sin6_addr)) {
+			struct in_addr *addr = ((struct in_addr *) (sin6->sin6_addr.s6_addr+12));
+			inet_ntop(AF_INET, addr, ip6, sizeof(ip6));
+		}
+		else {
+			inet_ntop(AF_INET6, &sin6->sin6_addr, ip6, sizeof(ip6));
+		}
 		snprintf(mesg, sizeof(mesg), xml,
 			 hostname,
 			 MANUFACTURER,
 			 url,
 			 MODEL,
 			 uuid,
-			 inet_ntoa(sin->sin_addr));
+			 ip6);
 		if (send(sd, mesg, strlen(mesg), 0) < 0)
 			logit(LOG_WARNING, "Failed sending file to client: %s", strerror(errno));
 	}
@@ -149,7 +172,7 @@ void web_recv(int sd)
 {
 	int client;
 	char ifname[IF_NAMESIZE] = "UNKNOWN";
-	struct sockaddr_in *sin;
+	struct sockaddr *sin;
 
 	client = accept(sd, NULL, NULL);
 	if (client < 0) {
@@ -168,7 +191,7 @@ void web_recv(int sd)
 	close(client);
 }
 
-void web_init(void)
+void web_init4(void)
 {
 	int sd;
 	struct sockaddr sa;
@@ -196,6 +219,41 @@ void web_init(void)
 		err(1, "Failed setting web listen backlog");
 
 	register_socket(sd, -1, &sa, NULL, web_recv);
+}
+
+void web_init6(void)
+{
+	int sd;
+	struct sockaddr_in6 serveraddr;
+
+	sd = socket(AF_INET6, SOCK_STREAM, 0);
+	if (sd == -1)
+		err(1, "Failed creating web socket");
+
+	memset(&serveraddr, 0, sizeof(serveraddr));
+	serveraddr.sin6_family = AF_INET6;
+	serveraddr.sin6_port = htons(LOCATION_PORT);
+	serveraddr.sin6_addr = in6addr_any;
+
+	DISABLE_SOCKOPT(sd, IPPROTO_IPV6, IPV6_V6ONLY);
+	ENABLE_SOCKOPT(sd, SOL_SOCKET, SO_REUSEADDR);
+#ifdef SO_REUSEPORT
+	ENABLE_SOCKOPT(sd, SOL_SOCKET, SO_REUSEPORT);
+#endif
+
+	if (bind(sd, (struct sockaddr *)&serveraddr, sizeof(serveraddr)) < 0)
+		err(1, "Failed binding web socket");
+
+	if (listen(sd, 10) != 0)
+		err(1, "Failed setting web listen backlog");
+
+	register_socket(sd, -1, (struct sockaddr *)&serveraddr, NULL, web_recv);
+}
+
+void web_init(void)
+{
+//	web_init4();
+	web_init6();
 }
 
 /**
