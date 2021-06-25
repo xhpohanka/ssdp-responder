@@ -47,7 +47,7 @@ const char *xml =
 	"  <manufacturer>%s</manufacturer>\r\n%s"
 	"  <modelName>%s</modelName>\r\n"
 	"  <UDN>uuid:%s</UDN>\r\n"
-	"  <presentationURL>http://%s</presentationURL>\r\n"
+	"  <presentationURL>https://%s</presentationURL>\r\n"
 	" </device>\r\n"
 	"</root>\r\n"
 	"\r\n";
